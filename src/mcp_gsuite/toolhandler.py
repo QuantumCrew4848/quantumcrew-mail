@@ -26,7 +26,7 @@ class ToolHandler():
     def get_user_id_arg_schema(self) -> dict:
         return {
             "type": "string",
-            "description": f"The EMAIL of the Google account for which you are executing this action. Can be one of: {', '.join(self.get_account_descriptions())}"
+            "description": f"The alias or email of the Google account. Can be one of: {', '.join(self.get_account_descriptions())}"
         }
 
     def get_tool_description(self) -> Tool:

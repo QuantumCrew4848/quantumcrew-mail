@@ -1,9 +1,9 @@
 [project]
-name = "mcp-gsuite"
-version = "0.4.1"
-description = "MCP Server to connect to Google G-Suite"
+name = "quantumcrew-mail"
+version = "1.0.0"
+description = "Multi-account Gmail & Calendar MCP server for AI-native inbox management"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
  "beautifulsoup4>=4.12.3",
  "google-api-python-client>=2.154.0",
@@ -15,8 +15,8 @@ dependencies = [
  "requests>=2.32.3",
 ]
 [[project.authors]]
-name = "Markus Pfundstein"
-email = "markus@life-electronic.nl"
+name = "QuantumCrew AI"
+email = "ai@quantumcrew.ai"
 
 [build-system]
 requires = [ "hatchling",]
@@ -28,4 +28,4 @@ dev = [
 ]
 
 [project.scripts]
-mcp-gsuite = "mcp_gsuite:main"
+quantumcrew-mail = "mcp_gsuite:main"

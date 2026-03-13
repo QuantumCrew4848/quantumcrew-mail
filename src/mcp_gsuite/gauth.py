@@ -42,12 +42,15 @@ class AccountInfo(pydantic.BaseModel):
     email: str
     account_type: str
     extra_info: str
+    alias: str
 
-    def __init__(self, email: str, account_type: str, extra_info: str = ""):
-        super().__init__(email=email, account_type=account_type, extra_info=extra_info)
+    def __init__(self, email: str, account_type: str, extra_info: str = "", alias: str = ""):
+        super().__init__(email=email, account_type=account_type, extra_info=extra_info, alias=alias or "")
 
     def to_description(self):
-        return f"""Account for email: {self.email} of type: {self.account_type}. Extra info for: {self.extra_info}"""
+        if self.alias:
+            return f"""Account "{self.alias}" ({self.email}) of type: {self.account_type}. Extra info: {self.extra_info}"""
+        return f"""Account for email: {self.email} of type: {self.account_type}. Extra info: {self.extra_info}"""
 
 
 def get_accounts_file() -> str:
@@ -68,6 +71,21 @@ def get_account_info() -> list[AccountInfo]:
         data = json.load(f)
         accounts = data.get("accounts", [])
         return [AccountInfo.model_validate(acc) for acc in accounts]
+
+def resolve_user_id(user_id: str) -> str:
+    """Resolve an alias or email to the canonical email address."""
+    accounts = get_account_info()
+    # Check if it's an alias first
+    for account in accounts:
+        if account.alias and account.alias.lower() == user_id.lower():
+            return account.email
+    # Check if it's a direct email match
+    for account in accounts:
+        if account.email.lower() == user_id.lower():
+            return account.email
+    # Return as-is if no match (will fail at auth time with a clear error)
+    return user_id
+
 
 class GetCredentialsException(Exception):
   """Error raised when an error occurred while retrieving credentials.

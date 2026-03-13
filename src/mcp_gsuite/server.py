@@ -98,7 +98,7 @@ def setup_oauth2(user_id: str):
         gauth.store_credentials(credentials=credentials, user_id=user_id)
 
 
-app = Server("mcp-gsuite")
+app = Server("quantumcrew-mail")
 
 tool_handlers = {}
 def add_tool_handler(tool_class: toolhandler.ToolHandler):
@@ -117,6 +117,13 @@ add_tool_handler(tools_gmail.GetEmailByIdToolHandler())
 add_tool_handler(tools_gmail.CreateDraftToolHandler())
 add_tool_handler(tools_gmail.DeleteDraftToolHandler())
 add_tool_handler(tools_gmail.ReplyEmailToolHandler())
+add_tool_handler(tools_gmail.SendEmailToolHandler())
+add_tool_handler(tools_gmail.ArchiveEmailToolHandler())
+add_tool_handler(tools_gmail.BatchArchiveEmailToolHandler())
+add_tool_handler(tools_gmail.LabelEmailToolHandler())
+add_tool_handler(tools_gmail.MarkEmailToolHandler())
+add_tool_handler(tools_gmail.TrashEmailToolHandler())
+add_tool_handler(tools_gmail.GetLabelsToolHandler())
 add_tool_handler(tools_gmail.GetAttachmentToolHandler())
 add_tool_handler(tools_gmail.BulkGetEmailsByIdsToolHandler())
 add_tool_handler(tools_gmail.BulkSaveAttachmentsToolHandler())
@@ -141,6 +148,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
         
         if toolhandler.USER_ID_ARG not in arguments:
             raise RuntimeError("user_id argument is missing in dictionary.")
+
+        # Resolve alias to email address
+        arguments[toolhandler.USER_ID_ARG] = gauth.resolve_user_id(arguments[toolhandler.USER_ID_ARG])
 
         setup_oauth2(user_id=arguments.get(toolhandler.USER_ID_ARG, ""))
 

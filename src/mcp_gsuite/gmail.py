@@ -230,6 +230,19 @@ class GmailService():
             logging.error(traceback.format_exc())
             return None, {}
         
+    def get_email_by_id(self, email_id: str) -> dict | None:
+        """Fetch and parse a single email by ID (without attachment details)."""
+        try:
+            message = self.service.users().messages().get(
+                userId='me',
+                id=email_id
+            ).execute()
+            return self._parse_message(txt=message, parse_body=True)
+        except Exception as e:
+            logging.error(f"Error retrieving email {email_id}: {str(e)}")
+            logging.error(traceback.format_exc())
+            return None
+
     def create_draft(self, to: str, subject: str, body: str, cc: list[str] | None = None) -> dict | None:
         """
         Create a draft email message.
@@ -343,8 +356,10 @@ class GmailService():
             if cc:
                 mime_message['cc'] = ','.join(cc)
                 
-            mime_message['In-Reply-To'] = original_message.get('id', '')
-            mime_message['References'] = original_message.get('id', '')
+            # Use the RFC Message-ID header for proper threading
+            rfc_message_id = original_message.get('message_id', original_message.get('id', ''))
+            mime_message['In-Reply-To'] = rfc_message_id
+            mime_message['References'] = original_message.get('references', rfc_message_id)
             
             raw_message = base64.urlsafe_b64encode(mime_message.as_bytes()).decode('utf-8')
             
@@ -375,6 +390,102 @@ class GmailService():
             logging.error(traceback.format_exc())
             return None
         
+    def send_email(self, to: str, subject: str, body: str, cc: list[str] | None = None) -> dict | None:
+        """Send a new email message."""
+        try:
+            mime_message = MIMEText(body)
+            mime_message['to'] = to
+            mime_message['subject'] = subject
+            if cc:
+                mime_message['cc'] = ','.join(cc)
+
+            raw_message = base64.urlsafe_b64encode(mime_message.as_bytes()).decode('utf-8')
+
+            result = self.service.users().messages().send(
+                userId='me',
+                body={'raw': raw_message}
+            ).execute()
+            return result
+        except Exception as e:
+            logging.error(f"Error sending email: {str(e)}")
+            logging.error(traceback.format_exc())
+            return None
+
+    def archive_email(self, email_id: str) -> bool:
+        """Archive an email by removing the INBOX label."""
+        try:
+            self.service.users().messages().modify(
+                userId='me',
+                id=email_id,
+                body={'removeLabelIds': ['INBOX']}
+            ).execute()
+            return True
+        except Exception as e:
+            logging.error(f"Error archiving email {email_id}: {str(e)}")
+            logging.error(traceback.format_exc())
+            return False
+
+    def batch_archive(self, email_ids: list[str]) -> dict:
+        """Archive multiple emails at once."""
+        results = {"archived": [], "failed": []}
+        for email_id in email_ids:
+            if self.archive_email(email_id):
+                results["archived"].append(email_id)
+            else:
+                results["failed"].append(email_id)
+        return results
+
+    def modify_labels(self, email_id: str, add_labels: list[str] | None = None, remove_labels: list[str] | None = None) -> bool:
+        """Add or remove labels from an email."""
+        try:
+            body = {}
+            if add_labels:
+                body['addLabelIds'] = add_labels
+            if remove_labels:
+                body['removeLabelIds'] = remove_labels
+            self.service.users().messages().modify(
+                userId='me',
+                id=email_id,
+                body=body
+            ).execute()
+            return True
+        except Exception as e:
+            logging.error(f"Error modifying labels on {email_id}: {str(e)}")
+            logging.error(traceback.format_exc())
+            return False
+
+    def mark_as_read(self, email_id: str) -> bool:
+        """Mark an email as read."""
+        return self.modify_labels(email_id, remove_labels=['UNREAD'])
+
+    def mark_as_unread(self, email_id: str) -> bool:
+        """Mark an email as unread."""
+        return self.modify_labels(email_id, add_labels=['UNREAD'])
+
+    def trash_email(self, email_id: str) -> bool:
+        """Move an email to trash."""
+        try:
+            self.service.users().messages().trash(
+                userId='me',
+                id=email_id
+            ).execute()
+            return True
+        except Exception as e:
+            logging.error(f"Error trashing email {email_id}: {str(e)}")
+            logging.error(traceback.format_exc())
+            return False
+
+    def get_labels(self) -> list[dict]:
+        """List all labels for the account."""
+        try:
+            results = self.service.users().labels().list(userId='me').execute()
+            labels = results.get('labels', [])
+            return [{"id": l["id"], "name": l["name"], "type": l.get("type", "")} for l in labels]
+        except Exception as e:
+            logging.error(f"Error listing labels: {str(e)}")
+            logging.error(traceback.format_exc())
+            return []
+
     def get_attachment(self, message_id: str, attachment_id: str) -> dict | None:
         """
         Retrieves a Gmail attachment by its ID.
