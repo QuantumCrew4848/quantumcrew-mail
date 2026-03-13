@@ -8,8 +8,48 @@ from mcp.types import (
 )
 from . import gmail
 import json
+import os
 from . import toolhandler
 import base64
+
+# Allowed base directories for saving attachments
+ALLOWED_SAVE_DIRS = [
+    os.path.expanduser("~/Downloads"),
+    os.path.expanduser("~/Documents"),
+    os.path.expanduser("~/Desktop"),
+]
+
+
+def validate_save_path(path: str) -> str:
+    """Validate and resolve a save path to prevent path traversal attacks.
+
+    Only allows saving to ~/Downloads, ~/Documents, or ~/Desktop.
+    Rejects paths with .., symlinks to outside allowed dirs, and absolute
+    paths outside the allow-list.
+    """
+    # Expand user home dir
+    resolved = os.path.realpath(os.path.expanduser(path))
+
+    # Check the resolved path falls within an allowed directory
+    allowed = False
+    for allowed_dir in ALLOWED_SAVE_DIRS:
+        real_allowed = os.path.realpath(allowed_dir)
+        if resolved.startswith(real_allowed + os.sep) or resolved == real_allowed:
+            allowed = True
+            break
+
+    if not allowed:
+        raise ValueError(
+            f"Save path not allowed: {path}. "
+            f"Files can only be saved to ~/Downloads, ~/Documents, or ~/Desktop."
+        )
+
+    # Ensure parent directory exists
+    parent = os.path.dirname(resolved)
+    os.makedirs(parent, exist_ok=True)
+
+    return resolved
+
 
 def decode_base64_data(file_data):
     standard_base64_data = file_data.replace("-", "+").replace("_", "/")
@@ -138,7 +178,8 @@ class BulkGetEmailsByIdsToolHandler(toolhandler.ToolHandler):
                         "items": {
                             "type": "string"
                         },
-                        "description": "List of Gmail message IDs to retrieve"
+                        "maxItems": 50,
+                        "description": "List of Gmail message IDs to retrieve (max 50)"
                     }
                 },
                 "required": ["email_ids", toolhandler.USER_ID_ARG]
@@ -459,7 +500,8 @@ class BatchArchiveEmailToolHandler(toolhandler.ToolHandler):
                     "email_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of Gmail message IDs to archive"
+                        "maxItems": 100,
+                        "description": "List of Gmail message IDs to archive (max 100)"
                     }
                 },
                 "required": ["email_ids", toolhandler.USER_ID_ARG]
@@ -678,13 +720,14 @@ class GetAttachmentToolHandler(toolhandler.ToolHandler):
         file_data = attachment_data["data"]
         attachment_url = f"attachment://gmail/{args['message_id']}/{args['attachment_id']}/{filename}"
         if args.get("save_to_disk"):
+            safe_path = validate_save_path(args["save_to_disk"])
             decoded_data = decode_base64_data(file_data)
-            with open(args["save_to_disk"], "wb") as f:
+            with open(safe_path, "wb") as f:
                 f.write(decoded_data)
             return [
                 TextContent(
                     type="text",
-                    text=f"Attachment saved to disk: {args['save_to_disk']}"
+                    text=f"Attachment saved to disk: {safe_path}"
                 )
             ]
         return [
@@ -712,6 +755,7 @@ class BulkSaveAttachmentsToolHandler(toolhandler.ToolHandler):
                     "__user_id__": self.get_user_id_arg_schema(),
                     "attachments": {
                         "type": "array",
+                        "maxItems": 20,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -720,12 +764,12 @@ class BulkSaveAttachmentsToolHandler(toolhandler.ToolHandler):
                                     "description": "ID of the Gmail message containing the attachment"
                                 },
                                 "part_id": {
-                                    "type": "string", 
+                                    "type": "string",
                                     "description": "ID of the part containing the attachment"
                                 },
                                 "save_path": {
                                     "type": "string",
-                                    "description": "Path where the attachment should be saved"
+                                    "description": "Path where the attachment should be saved (must be within ~/Downloads, ~/Documents, or ~/Desktop)"
                                 }
                             },
                             "required": ["message_id", "part_id", "save_path"]
@@ -776,21 +820,22 @@ class BulkSaveAttachmentsToolHandler(toolhandler.ToolHandler):
                 continue
 
             file_data = attachment_data["data"]
-            try:    
+            try:
+                safe_path = validate_save_path(attachment_info["save_path"])
                 decoded_data = decode_base64_data(file_data)
-                with open(attachment_info["save_path"], "wb") as f:
+                with open(safe_path, "wb") as f:
                     f.write(decoded_data)
                 results.append(
                     TextContent(
                         type="text",
-                        text=f"Attachment saved to: {attachment_info['save_path']}"
+                        text=f"Attachment saved to: {safe_path}"
                     )
                 )
-            except Exception as e:
+            except (ValueError, Exception) as e:
                 results.append(
                     TextContent(
                         type="text",
-                        text=f"Failed to save attachment to {attachment_info['save_path']}: {str(e)}"
+                        text=f"Failed to save attachment: {str(e)}"
                     )
                 )
                 continue

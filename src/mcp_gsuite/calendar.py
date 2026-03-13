@@ -9,8 +9,11 @@ class CalendarService():
     def __init__(self, user_id: str):
         credentials = gauth.get_stored_credentials(user_id=user_id)
         if not credentials:
-            raise RuntimeError("No Oauth2 credentials stored")
-        self.service = build('calendar', 'v3', credentials=credentials)  # Note: using v3 for Calendar API
+            raise RuntimeError(f"No OAuth2 credentials stored for {user_id}")
+        if credentials.expired and credentials.refresh_token:
+            credentials = gauth.refresh_credentials(credentials)
+            gauth.store_credentials(credentials, user_id=user_id)
+        self.service = build('calendar', 'v3', credentials=credentials)
     
     def list_calendars(self) -> list:
         """

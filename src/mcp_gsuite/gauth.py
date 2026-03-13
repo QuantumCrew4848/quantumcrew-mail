@@ -1,277 +1,214 @@
 import logging
-from oauth2client.client import (
-    flow_from_clientsecrets,
-    FlowExchangeError,
-    OAuth2Credentials,
-    Credentials,
-)
-from googleapiclient.discovery import build
-import httplib2
-from google.auth.transport.requests import Request
 import os
-import pydantic
 import json
+import stat
 import argparse
 
-
-def get_gauth_file() -> str:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--gauth-file",
-        type=str,
-        default="./.gauth.json",
-        help="Path to client secrets file",
-    )
-    args, _ = parser.parse_known_args()
-    return args.gauth_file
+import pydantic
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
 
-CLIENTSECRETS_LOCATION = get_gauth_file()
+# --- CLI argument parsing (single parser, parsed once) ---
 
+_parser = argparse.ArgumentParser()
+_parser.add_argument(
+    "--gauth-file", type=str, default="./.gauth.json",
+    help="Path to Google OAuth client secrets file",
+)
+_parser.add_argument(
+    "--accounts-file", type=str, default="./.accounts.json",
+    help="Path to accounts configuration file",
+)
+_parser.add_argument(
+    "--credentials-dir", type=str, default=".",
+    help="Directory to store OAuth2 credential files",
+)
+_cli_args, _ = _parser.parse_known_args()
+
+CLIENTSECRETS_LOCATION = _cli_args.gauth_file
 REDIRECT_URI = 'http://localhost:4100/code'
+
+# Principle of least privilege — gmail.modify covers read + label + archive
+# + trash + send. No need for the nuclear https://mail.google.com/ scope.
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
-    "https://mail.google.com/",
-    "https://www.googleapis.com/auth/calendar"
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
 ]
 
 
-class AccountInfo(pydantic.BaseModel):
+# --- Account model ---
 
+class AccountInfo(pydantic.BaseModel):
     email: str
     account_type: str
-    extra_info: str
-    alias: str
-
-    def __init__(self, email: str, account_type: str, extra_info: str = "", alias: str = ""):
-        super().__init__(email=email, account_type=account_type, extra_info=extra_info, alias=alias or "")
+    extra_info: str = ""
+    alias: str = ""
 
     def to_description(self):
         if self.alias:
-            return f"""Account "{self.alias}" ({self.email}) of type: {self.account_type}. Extra info: {self.extra_info}"""
-        return f"""Account for email: {self.email} of type: {self.account_type}. Extra info: {self.extra_info}"""
+            return f'Account "{self.alias}" ({self.email}) — {self.account_type}'
+        return f"Account {self.email} — {self.account_type}"
 
 
-def get_accounts_file() -> str:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--accounts-file",
-        type=str,
-        default="./.accounts.json",
-        help="Path to accounts configuration file",
-    )
-    args, _ = parser.parse_known_args()
-    return args.accounts_file
+# --- Account registry ---
+
+_accounts_cache: list[AccountInfo] | None = None
 
 
 def get_account_info() -> list[AccountInfo]:
-    accounts_file = get_accounts_file()
-    with open(accounts_file) as f:
+    """Load and cache the accounts list from disk."""
+    global _accounts_cache
+    if _accounts_cache is not None:
+        return _accounts_cache
+    with open(_cli_args.accounts_file) as f:
         data = json.load(f)
-        accounts = data.get("accounts", [])
-        return [AccountInfo.model_validate(acc) for acc in accounts]
+        _accounts_cache = [AccountInfo.model_validate(acc) for acc in data.get("accounts", [])]
+    return _accounts_cache
+
 
 def resolve_user_id(user_id: str) -> str:
-    """Resolve an alias or email to the canonical email address."""
+    """Resolve an alias or email to the canonical email address.
+
+    Raises ValueError if the user_id doesn't match any configured account,
+    preventing credential filename injection attacks.
+    """
     accounts = get_account_info()
-    # Check if it's an alias first
+    # Check alias first
     for account in accounts:
         if account.alias and account.alias.lower() == user_id.lower():
             return account.email
-    # Check if it's a direct email match
+    # Check email
     for account in accounts:
         if account.email.lower() == user_id.lower():
             return account.email
-    # Return as-is if no match (will fail at auth time with a clear error)
-    return user_id
-
-
-class GetCredentialsException(Exception):
-  """Error raised when an error occurred while retrieving credentials.
-
-  Attributes:
-    authorization_url: Authorization URL to redirect the user to in order to
-                       request offline access.
-  """
-
-  def __init__(self, authorization_url):
-    """Construct a GetCredentialsException."""
-    self.authorization_url = authorization_url
-
-
-class CodeExchangeException(GetCredentialsException):
-  """Error raised when a code exchange has failed."""
-
-
-class NoRefreshTokenException(GetCredentialsException):
-  """Error raised when no refresh token has been found."""
-
-
-class NoUserIdException(Exception):
-  """Error raised when no user ID could be retrieved."""
-
-
-def get_credentials_dir() -> str:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--credentials-dir",
-        type=str,
-        default=".",
-        help="Directory to store OAuth2 credentials",
+    # No match — refuse to proceed
+    known = [a.alias or a.email for a in accounts]
+    raise ValueError(
+        f"Unknown account: '{user_id}'. "
+        f"Configured accounts: {', '.join(known)}"
     )
-    args, _ = parser.parse_known_args()
-    return args.credentials_dir
 
+
+# --- Credential storage ---
 
 def _get_credential_filename(user_id: str) -> str:
-    creds_dir = get_credentials_dir()
-    return os.path.join(creds_dir, f".oauth2.{user_id}.json")
+    """Build the credential file path. user_id must already be validated."""
+    return os.path.join(_cli_args.credentials_dir, f".oauth2.{user_id}.json")
 
 
-def get_stored_credentials(user_id: str) -> OAuth2Credentials | None:
-    """Retrieved stored credentials for the provided user ID.
-
-    Args:
-    user_id: User's ID.
-    Returns:
-    Stored oauth2client.client.OAuth2Credentials if found, None otherwise.
-    """
-    try:
-
-        cred_file_path = _get_credential_filename(user_id=user_id)
-        if not os.path.exists(cred_file_path):
-            logging.warning(f"No stored Oauth2 credentials yet at path: {cred_file_path}")
-            return None
-
-        with open(cred_file_path, 'r') as f:
-            data = f.read()
-            return Credentials.new_from_json(data)
-    except Exception as e:
-        logging.error(e)
+def get_stored_credentials(user_id: str) -> Credentials | None:
+    """Load stored OAuth2 credentials for a user. Returns None if not found."""
+    cred_file_path = _get_credential_filename(user_id=user_id)
+    if not os.path.exists(cred_file_path):
+        logging.info(f"No stored credentials for {user_id}")
         return None
 
-    raise None
-
-
-def store_credentials(credentials: OAuth2Credentials, user_id: str):
-    """Store OAuth 2.0 credentials in the specified directory."""
-    cred_file_path = _get_credential_filename(user_id=user_id)
-    os.makedirs(os.path.dirname(cred_file_path), exist_ok=True)
-    
-    data = credentials.to_json()
-    with open(cred_file_path, "w") as f:
-        f.write(data)
-
-
-def exchange_code(authorization_code):
-    """Exchange an authorization code for OAuth 2.0 credentials.
-
-    Args:
-    authorization_code: Authorization code to exchange for OAuth 2.0
-                        credentials.
-    Returns:
-    oauth2client.client.OAuth2Credentials instance.
-    Raises:
-    CodeExchangeException: an error occurred.
-    """
-    flow = flow_from_clientsecrets(CLIENTSECRETS_LOCATION, ' '.join(SCOPES))
-    flow.redirect_uri = REDIRECT_URI
     try:
-        credentials = flow.step2_exchange(authorization_code)
-        return credentials
-    except FlowExchangeError as error:
-        logging.error('An error occurred: %s', error)
-        raise CodeExchangeException(None)
+        with open(cred_file_path, 'r') as f:
+            cred_data = json.load(f)
 
-
-def get_user_info(credentials):
-    """Send a request to the UserInfo API to retrieve the user's information.
-
-    Args:
-    credentials: oauth2client.client.OAuth2Credentials instance to authorize the
-                    request.
-    Returns:
-    User information as a dict.
-    """
-    user_info_service = build(
-        serviceName='oauth2', version='v2',
-        http=credentials.authorize(httplib2.Http()))
-    user_info = None
-    try:
-        user_info = user_info_service.userinfo().get().execute()
+        creds = Credentials(
+            token=cred_data.get("token"),
+            refresh_token=cred_data.get("refresh_token"),
+            token_uri=cred_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=cred_data.get("client_id"),
+            client_secret=cred_data.get("client_secret"),
+            scopes=cred_data.get("scopes", SCOPES),
+        )
+        return creds
     except Exception as e:
-        logging.error(f'An error occurred: {e}')
-    if user_info and user_info.get('id'):
-        return user_info
-    else:
-        raise NoUserIdException()
+        logging.error(f"Failed to load credentials for {user_id}: {e}")
+        return None
 
 
-def get_authorization_url(email_address, state):
-    """Retrieve the authorization URL.
+def store_credentials(credentials: Credentials, user_id: str):
+    """Store OAuth2 credentials to disk with restrictive file permissions (0600)."""
+    cred_file_path = _get_credential_filename(user_id=user_id)
+    parent_dir = os.path.dirname(cred_file_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
-    Args:
-    email_address: User's e-mail address.
-    state: State for the authorization URL.
-    Returns:
-    Authorization URL to redirect the user to.
-    """
-    flow = flow_from_clientsecrets(CLIENTSECRETS_LOCATION, ' '.join(SCOPES), redirect_uri=REDIRECT_URI)
-    flow.params['access_type'] = 'offline'
-    flow.params['approval_prompt'] = 'force'
-    flow.params['user_id'] = email_address
-    flow.params['state'] = state
-    return flow.step1_get_authorize_url(state=state)
+    cred_data = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": list(credentials.scopes) if credentials.scopes else SCOPES,
+    }
 
-
-def get_credentials(authorization_code, state):
-    """Retrieve credentials using the provided authorization code.
-
-    This function exchanges the authorization code for an access token and queries
-    the UserInfo API to retrieve the user's e-mail address.
-    If a refresh token has been retrieved along with an access token, it is stored
-    in the application database using the user's e-mail address as key.
-    If no refresh token has been retrieved, the function checks in the application
-    database for one and returns it if found or raises a NoRefreshTokenException
-    with the authorization URL to redirect the user to.
-
-    Args:
-    authorization_code: Authorization code to use to retrieve an access token.
-    state: State to set to the authorization URL in case of error.
-    Returns:
-    oauth2client.client.OAuth2Credentials instance containing an access and
-    refresh token.
-    Raises:
-    CodeExchangeError: Could not exchange the authorization code.
-    NoRefreshTokenException: No refresh token could be retrieved from the
-                                available sources.
-    """
-    email_address = ''
+    # Write with 0600 permissions — owner read/write only
+    fd = os.open(cred_file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        credentials = exchange_code(authorization_code)
-        user_info = get_user_info(credentials)
-        import json
-        logging.error(f"user_info: {json.dumps(user_info)}")
-        email_address = user_info.get('email')
-        
-        if credentials.refresh_token is not None:
-            store_credentials(credentials, user_id=email_address)
-            return credentials
-        else:
-            credentials = get_stored_credentials(user_id=email_address)
-            if credentials and credentials.refresh_token is not None:
-                return credentials
-    except CodeExchangeException as error:
-        logging.error('An error occurred during code exchange.')
-        # Drive apps should try to retrieve the user and credentials for the current
-        # session.
-        # If none is available, redirect the user to the authorization URL.
-        error.authorization_url = get_authorization_url(email_address, state)
-        raise error
-    except NoUserIdException:
-        logging.error('No user ID could be retrieved.')
-        # No refresh token has been retrieved.
-    authorization_url = get_authorization_url(email_address, state)
-    raise NoRefreshTokenException(authorization_url)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(cred_data, f, indent=2)
+    except Exception:
+        os.close(fd)
+        raise
 
+    # Enforce permissions even if file existed with different perms
+    os.chmod(cred_file_path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+# --- OAuth flow ---
+
+def get_authorization_url(user_id: str) -> str:
+    """Build the OAuth authorization URL for a user."""
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CLIENTSECRETS_LOCATION, scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type='offline',
+        prompt='consent',
+        login_hint=user_id,
+    )
+    return auth_url
+
+
+def run_oauth_flow(user_id: str) -> Credentials:
+    """Run the full OAuth2 authorization flow for a user.
+
+    Opens a browser, waits for the callback on localhost:4100, exchanges
+    the code, stores credentials, and returns them.
+    """
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CLIENTSECRETS_LOCATION, scopes=SCOPES,
+    )
+    creds = flow.run_local_server(
+        port=4100,
+        prompt='consent',
+        access_type='offline',
+        login_hint=user_id,
+    )
+    # Verify the authenticated user matches the expected account
+    user_info = get_user_info(creds)
+    authenticated_email = user_info.get('email', '')
+    if authenticated_email.lower() != user_id.lower():
+        logging.warning(
+            f"Authenticated as {authenticated_email} but expected {user_id}. "
+            f"Storing credentials under authenticated email."
+        )
+    store_credentials(creds, user_id=authenticated_email)
+    return creds
+
+
+def refresh_credentials(credentials: Credentials) -> Credentials:
+    """Refresh expired credentials. Returns refreshed credentials."""
+    if credentials.expired and credentials.refresh_token:
+        credentials.refresh(Request())
+    return credentials
+
+
+def get_user_info(credentials: Credentials) -> dict:
+    """Retrieve basic user info (email, id) from the authenticated account."""
+    service = build('oauth2', 'v2', credentials=credentials)
+    user_info = service.userinfo().get().execute()
+    if not user_info or not user_info.get('id'):
+        raise RuntimeError("Failed to retrieve user info from Google")
+    return user_info

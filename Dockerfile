@@ -35,4 +35,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 4100
 
 # Specify the entrypoint command
-ENTRYPOINT ["uv", "run", "mcp-gsuite"]
+ENTRYPOINT ["quantumcrew-mail"]

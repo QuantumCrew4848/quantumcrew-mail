@@ -11,7 +11,11 @@ class GmailService():
     def __init__(self, user_id: str):
         credentials = gauth.get_stored_credentials(user_id=user_id)
         if not credentials:
-            raise RuntimeError("No Oauth2 credentials stored")
+            raise RuntimeError(f"No OAuth2 credentials stored for {user_id}")
+        # Auto-refresh if expired
+        if credentials.expired and credentials.refresh_token:
+            credentials = gauth.refresh_credentials(credentials)
+            gauth.store_credentials(credentials, user_id=user_id)
         self.service = build('gmail', 'v1', credentials=credentials)
 
     def _parse_message(self, txt, parse_body=False) -> dict | None:
